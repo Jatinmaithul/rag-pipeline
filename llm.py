@@ -36,7 +36,7 @@ def _get_groq_llm() -> BaseLanguageModel:
             "Get a free key at: https://console.groq.com"
         )
 
-    model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
     try:
         from langchain_groq import ChatGroq
