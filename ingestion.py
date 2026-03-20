@@ -26,6 +26,11 @@ def load_documents(file_paths: List[str]) -> List[Document]:
 
     for file_path in file_paths:
         path = Path(file_path)
+
+        if not path.exists():
+            print(f"❌ File not found: {path}")
+            continue
+
         ext = path.suffix.lower()
 
         if ext not in SUPPORTED_EXTENSIONS:
@@ -51,49 +56,95 @@ def _load_file(file_path: str, ext: str) -> List[Document]:
         from langchain_community.document_loaders import UnstructuredFileLoader
         loader = UnstructuredFileLoader(file_path, mode="elements")
         return loader.load()
-    except Exception:
-        pass  # Fall back to specific loaders
+    except Exception as e:
+        print(f"   ⚠️  Unstructured failed ({e}), falling back to basic loader")
 
     # Fallback loaders
     if ext == ".pdf":
         from langchain_community.document_loaders import PyMuPDFLoader
-        loader = PyMuPDFLoader(file_path)
-        return loader.load()
+        return PyMuPDFLoader(file_path).load()
 
     elif ext in (".txt", ".md"):
         from langchain_community.document_loaders import TextLoader
-        loader = TextLoader(file_path, encoding="utf-8")
-        return loader.load()
+        return TextLoader(file_path, encoding="utf-8").load()
 
     elif ext == ".docx":
         from langchain_community.document_loaders import Docx2txtLoader
-        loader = Docx2txtLoader(file_path)
-        return loader.load()
+        return Docx2txtLoader(file_path).load()
 
     elif ext in (".html", ".htm"):
         from langchain_community.document_loaders import UnstructuredHTMLLoader
-        loader = UnstructuredHTMLLoader(file_path)
-        return loader.load()
+        return UnstructuredHTMLLoader(file_path).load()
 
     raise ValueError(f"No loader available for: {ext}")
 
 
+def _clean_content(text: str) -> str:
+    """Extract readable text from JSON content if needed."""
+    import json
+    stripped = text.strip()
+    if not (stripped.startswith("{") or stripped.startswith("[")):
+        return text
+    try:
+        data = json.loads(stripped)
+        parts = []
+        items = data if isinstance(data, list) else [data]
+        for item in items:
+            if isinstance(item, dict):
+                for key in ["Content", "content", "Summary", "summary",
+                            "Title", "title", "text", "Text", "body", "Body"]:
+                    if key in item and item[key]:
+                        parts.append(str(item[key]))
+            else:
+                parts.append(str(item))
+        return "\n\n".join(parts) if parts else text
+    except Exception:
+        return text
+
+
 def chunk_documents(
     documents: List[Document],
-    chunk_size: int = 500,
-    chunk_overlap: int = 50,
+    chunk_size: int = 300,
+    chunk_overlap: int = 30,
 ) -> List[Document]:
     """
-    Split documents into chunks using recursive character splitting.
-    Preserves metadata from the original document.
+    Split documents into chunks.
+    Tries semantic chunking first, falls back to recursive character splitting.
     """
+    if chunk_overlap >= chunk_size:
+        raise ValueError(
+            f"chunk_overlap ({chunk_overlap}) must be less than chunk_size ({chunk_size})"
+        )
+
+    # Clean and filter documents
+    for doc in documents:
+        doc.page_content = _clean_content(doc.page_content)
+    documents = [d for d in documents if d.page_content and d.page_content.strip()]
+    if not documents:
+        print("⚠️  No valid documents to chunk.")
+        return []
+
+    # Try semantic chunking (splits by meaning, not character count)
+    try:
+        from langchain_experimental.text_splitter import SemanticChunker
+        from vectorstore import get_embeddings
+        print("✂️  Using semantic chunking...")
+        splitter = SemanticChunker(
+            get_embeddings(),
+            breakpoint_threshold_type="percentile",
+        )
+        chunks = splitter.split_documents(documents)
+        print(f"   ✅ Created {len(chunks)} semantic chunks from {len(documents)} document(s)")
+        return chunks
+    except Exception as e:
+        print(f"   ⚠️  Semantic chunking unavailable ({e}), using recursive splitting")
+
+    # Fallback: recursive character splitting
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
-        length_function=len,
         separators=["\n\n", "\n", ". ", " ", ""],
     )
-
     chunks = splitter.split_documents(documents)
     print(f"✂️  Created {len(chunks)} chunks from {len(documents)} document(s)")
     return chunks

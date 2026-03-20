@@ -113,6 +113,7 @@ def init_session():
         "rag_chain": None,
         "retriever": None,
         "chat_history": [],
+        "chunks": [],
         "docs_loaded": False,
         "doc_count": 0,
         "chunk_count": 0,
@@ -179,6 +180,7 @@ with st.sidebar:
         st.session_state.retriever = None
         st.session_state.docs_loaded = False
         st.session_state.chunk_count = 0
+        st.session_state.chunks = []
         st.session_state.chat_history = []
         st.success("Cleared!")
         st.rerun()
@@ -245,7 +247,10 @@ with col1:
                         st.info("🤖 Loading LLM...")
                         llm = get_llm(llm_provider)
 
-                        chain, retriever = build_rag_chain(vs, llm, top_k)
+                        st.session_state.chunks.extend(chunks)
+                        chain, retriever = build_rag_chain(
+                            vs, llm, top_k, st.session_state.chunks
+                        )
 
                         st.session_state.vectorstore = vs
                         st.session_state.rag_chain = chain
@@ -333,6 +338,10 @@ with col2:
     if submitted and user_input:
         if not st.session_state.docs_loaded:
             st.warning("⚠️ Please index documents first.")
+        elif len(user_input.strip()) < 3:
+            st.warning("⚠️ Please ask a more specific question.")
+        elif len(user_input.strip()) > 500:
+            st.warning("⚠️ Question is too long. Please keep it under 500 characters.")
         else:
             with st.spinner("Retrieving & generating..."):
                 try:
@@ -342,6 +351,7 @@ with col2:
                         user_input,
                         st.session_state.rag_chain,
                         st.session_state.retriever,
+                        chat_history=st.session_state.chat_history,
                     )
 
                     st.session_state.chat_history.append(

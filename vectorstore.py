@@ -1,25 +1,29 @@
 """
 vectorstore.py
 --------------
-Manages embeddings (sentence-transformers) and ChromaDB vector store.
+Manages embeddings (BGE via sentence-transformers) and Supabase vector store.
 """
 
 import os
 from typing import List, Optional
 
 from langchain_core.documents import Document
-from langchain_community.vectorstores import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 
 
 # ── Singleton embedding model (load once, reuse) ──────────────────────────────
 _embedding_model: Optional[HuggingFaceEmbeddings] = None
 
+DEFAULT_EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 
-def get_embeddings(model_name: str = "all-MiniLM-L6-v2") -> HuggingFaceEmbeddings:
+
+def get_embeddings(model_name: str = DEFAULT_EMBEDDING_MODEL) -> HuggingFaceEmbeddings:
     """Return a cached HuggingFace embedding model."""
     global _embedding_model
     if _embedding_model is None:
+        hf_token = os.getenv("HF_TOKEN", "")
+        if hf_token:
+            os.environ["HUGGINGFACEHUB_API_TOKEN"] = hf_token
         print(f"🔢 Loading embedding model: {model_name}")
         _embedding_model = HuggingFaceEmbeddings(
             model_name=model_name,
@@ -30,57 +34,88 @@ def get_embeddings(model_name: str = "all-MiniLM-L6-v2") -> HuggingFaceEmbedding
     return _embedding_model
 
 
-# ── ChromaDB Vector Store ─────────────────────────────────────────────────────
+def _get_supabase_client():
+    """Return a Supabase client using env credentials."""
+    from supabase import create_client
+    url = os.getenv("SUPABASE_URL", "")
+    key = os.getenv("SUPABASE_SERVICE_KEY", "")
+    if not url or not key:
+        raise EnvironmentError(
+            "SUPABASE_URL and SUPABASE_SERVICE_KEY must be set in your .env file."
+        )
+    return create_client(url, key)
+
+
+# ── Supabase Vector Store ─────────────────────────────────────────────────────
 
 def build_vectorstore(
     chunks: List[Document],
-    persist_dir: str = "./chroma_db",
-    collection_name: str = "rag_documents",
-    embedding_model: str = "all-MiniLM-L6-v2",
-) -> Chroma:
-    """
-    Embed chunks and store them in ChromaDB.
-    Persists to disk so you don't re-embed on every run.
-    """
-    embeddings = get_embeddings(embedding_model)
-
+    table_name: str = "document_embeddings",
+    query_name: str = "match_documents",
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+):
+    """Embed chunks and store them in Supabase."""
+    from langchain_community.vectorstores import SupabaseVectorStore
     from langchain_community.vectorstores.utils import filter_complex_metadata
+
+    embeddings = get_embeddings(embedding_model)
+    client = _get_supabase_client()
     chunks = filter_complex_metadata(chunks)
 
-    print(f"💾 Storing {len(chunks)} chunks in ChromaDB...")
-    vectorstore = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        persist_directory=persist_dir,
-        collection_name=collection_name,
-    )
-    print(f"   ✅ Vectorstore saved to: {persist_dir}")
+    import time
+    print(f"💾 Storing {len(chunks)} chunks in Supabase (batched)...")
+    batch_size = 5
+    vectorstore = None
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i:i + batch_size]
+        try:
+            if vectorstore is None:
+                vectorstore = SupabaseVectorStore.from_documents(
+                    documents=batch,
+                    embedding=embeddings,
+                    client=client,
+                    table_name=table_name,
+                    query_name=query_name,
+                )
+            else:
+                vectorstore.add_documents(batch)
+            print(f"   Uploaded {min(i + batch_size, len(chunks))}/{len(chunks)} chunks...")
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"   ⚠️ Batch {i}-{i+batch_size} failed: {e}, retrying...")
+            time.sleep(2)
+            try:
+                vectorstore.add_documents(batch)
+            except Exception as e2:
+                print(f"   ❌ Skipping batch: {e2}")
+    print("   ✅ Vectorstore saved to Supabase")
     return vectorstore
 
 
 def load_vectorstore(
-    persist_dir: str = "./chroma_db",
-    collection_name: str = "rag_documents",
-    embedding_model: str = "all-MiniLM-L6-v2",
-) -> Optional[Chroma]:
-    """
-    Load an existing ChromaDB vectorstore from disk.
-    Returns None if no vectorstore exists yet.
-    """
-    if not os.path.exists(persist_dir):
-        return None
+    table_name: str = "document_embeddings",
+    query_name: str = "match_documents",
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+):
+    """Load existing vectorstore from Supabase. Returns None if empty."""
+    from langchain_community.vectorstores import SupabaseVectorStore
 
     embeddings = get_embeddings(embedding_model)
+    client = _get_supabase_client()
+
     try:
-        vectorstore = Chroma(
-            persist_directory=persist_dir,
-            embedding_function=embeddings,
-            collection_name=collection_name,
+        vectorstore = SupabaseVectorStore(
+            embedding=embeddings,
+            client=client,
+            table_name=table_name,
+            query_name=query_name,
         )
-        count = vectorstore._collection.count()
+        # Check if table has data
+        result = client.table(table_name).select("*", count="exact").limit(1).execute()
+        count = result.count or 0
         if count == 0:
             return None
-        print(f"📦 Loaded vectorstore with {count} chunks from: {persist_dir}")
+        print(f"📦 Loaded Supabase vectorstore ({count} chunks)")
         return vectorstore
     except Exception as e:
         print(f"⚠️  Could not load vectorstore: {e}")
@@ -88,20 +123,19 @@ def load_vectorstore(
 
 
 def add_to_vectorstore(
-    vectorstore: Chroma,
+    vectorstore,
     chunks: List[Document],
-) -> Chroma:
-    """Add new chunks to an existing vectorstore."""
+):
+    """Add new chunks to existing Supabase vectorstore."""
     from langchain_community.vectorstores.utils import filter_complex_metadata
     chunks = filter_complex_metadata(chunks)
     vectorstore.add_documents(chunks)
-    print(f"➕ Added {len(chunks)} new chunks to vectorstore")
+    print(f"➕ Added {len(chunks)} new chunks to Supabase")
     return vectorstore
 
 
-def clear_vectorstore(persist_dir: str = "./chroma_db") -> None:
-    """Delete the vectorstore from disk."""
-    import shutil
-    if os.path.exists(persist_dir):
-        shutil.rmtree(persist_dir)
-        print(f"🗑️  Cleared vectorstore at: {persist_dir}")
+def clear_vectorstore(table_name: str = "document_embeddings") -> None:
+    """Delete all documents from Supabase table."""
+    client = _get_supabase_client()
+    client.table(table_name).delete().neq("id", 0).execute()
+    print(f"🗑️  Cleared Supabase vectorstore (table: {table_name})")

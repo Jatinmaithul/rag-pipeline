@@ -2,10 +2,20 @@
 llm.py
 ------
 LLM provider abstraction — supports Groq (hosted) and Ollama (local).
+Includes InMemoryCache so repeated identical queries skip the API call.
 """
 
 import os
 from langchain_core.language_models import BaseLanguageModel
+
+# ── LLM Caching (same question = instant response, no API cost) ───────────────
+try:
+    from langchain_community.cache import InMemoryCache
+    from langchain.globals import set_llm_cache
+    set_llm_cache(InMemoryCache())
+    print("⚡ LLM cache enabled (InMemory)")
+except Exception:
+    pass
 
 
 def get_llm(provider: str = "groq") -> BaseLanguageModel:
@@ -44,7 +54,7 @@ def _get_groq_llm() -> BaseLanguageModel:
             api_key=api_key,
             model_name=model,
             temperature=0.2,
-            max_tokens=1024,
+            max_tokens=512,
         )
         print(f"🤖 Using Groq LLM: {model}")
         return llm
